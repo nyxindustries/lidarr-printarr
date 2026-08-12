@@ -255,7 +255,9 @@ def test_retry_after_numeric():
 
 def test_retry_after_clamped():
     assert _retry_after_seconds("86400", fallback=2.0) == 60.0
-    assert _retry_after_seconds("-5", fallback=2.0) == 0.0
+    # "Retry now" still backs off at least a second — the server said slow down
+    assert _retry_after_seconds("-5", fallback=2.0) == 1.0
+    assert _retry_after_seconds("0", fallback=2.0) == 1.0
 
 
 def test_retry_after_http_date():
