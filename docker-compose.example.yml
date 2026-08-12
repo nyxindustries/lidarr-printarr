@@ -1,7 +1,7 @@
 services:
   printarr:
-    build: .
-    # or, once published: image: ghcr.io/styx-techno/lidarr-printarr:latest
+    image: ghcr.io/nyxindustries/lidarr-printarr:latest
+    # or build from source: replace the image line with `build: .`
     container_name: printarr
     environment:
       PRINTARR_LIDARR_URL: "http://lidarr:8686"
