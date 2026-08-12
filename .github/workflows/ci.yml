@@ -7,24 +7,25 @@ on:
 
 jobs:
   test:
-    # Org self-hosted runner (zelos, an Unraid box — labels: self-hosted,
-    # Linux, X64, unraid). Tests run inside a container so the runner host
-    # needs nothing but Docker — no sudo, no Python toolchain.
+    # Org self-hosted runner (zelos, Unraid). The runner is itself a container
+    # talking to the host Docker via docker.sock, so `container:` jobs break:
+    # the runner's externals path does not exist on the host and the job
+    # container gets no Node runtime. Instead, tests run via an explicit
+    # `docker run` on the workspace — its path is identity-mapped between the
+    # runner container and the host, so that mount resolves correctly.
     runs-on: [self-hosted, unraid]
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
-    container:
-      image: python:${{ matrix.python-version }}-slim
     steps:
       - uses: actions/checkout@v4
-      - name: Install system dependencies (ffmpeg for test fixtures, fpcalc)
+      - name: Lint and test (python:${{ matrix.python-version }}-slim)
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ffmpeg libchromaprint-tools git
-      - name: Install package
-        run: pip install -e ".[dev]"
-      - name: Lint
-        run: ruff check printarr tests
-      - name: Test
-        run: pytest -v
+          docker run --rm -v "$PWD":/src -w /src \
+            python:${{ matrix.python-version }}-slim bash -ec '
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends ffmpeg libchromaprint-tools > /dev/null
+              pip install -q -e ".[dev]"
+              ruff check printarr tests
+              pytest -v
+            '
