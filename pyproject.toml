@@ -37,8 +37,8 @@ dev = [
 printarr = "printarr.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/styx-techno/lidarr-printarr"
-Issues = "https://github.com/styx-techno/lidarr-printarr/issues"
+Homepage = "https://github.com/nyxindustries/lidarr-printarr"
+Issues = "https://github.com/nyxindustries/lidarr-printarr/issues"
 
 [tool.setuptools.packages.find]
 include = ["printarr*"]

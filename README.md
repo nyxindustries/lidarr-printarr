@@ -69,12 +69,13 @@ instead. Mistagging a music library is worse than a manual import.
 Requirements: Python ≥ 3.11 and `fpcalc` (Chromaprint).
 
 ```bash
-# Debian/Ubuntu
-sudo apt install libchromaprint-tools
-pip install git+https://github.com/styx-techno/lidarr-printarr
-
-# or with Docker
+# Docker (recommended) — multi-arch images on GHCR (amd64 + arm64)
+docker pull ghcr.io/nyxindustries/lidarr-printarr:latest   # or :<version> / :edge
 docker compose -f docker-compose.example.yml up -d
+
+# or from source (Debian/Ubuntu)
+sudo apt install libchromaprint-tools
+pip install git+https://github.com/nyxindustries/lidarr-printarr
 ```
 
 You need two free keys:
@@ -184,6 +185,16 @@ Boards of Canada — Geogaddi (2002)
   Lidarr stays the owner of your library layout.
 - MusicBrainz data improves over time — failed items are retried after
   `retry_cooldown` automatically in watch mode.
+
+## Releases
+
+Tagged releases publish a multi-arch Docker image (linux/amd64, linux/arm64) to
+`ghcr.io/nyxindustries/lidarr-printarr` with `:<version>` and `:latest` tags;
+every push to `main` refreshes `:edge`. To cut a release, either publish a
+GitHub release for a `v<version>` tag, or run the **Release** workflow manually
+with the version number — it creates the tag and the GitHub release for you.
+The workflow refuses to release when the version doesn't match
+`pyproject.toml`, so bump that first.
 
 ## Development
 

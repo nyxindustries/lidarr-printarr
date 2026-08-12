@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.source="https://github.com/nyxindustries/lidarr-printarr" \
+      org.opencontainers.image.description="Acoustic-fingerprint music identifier, tagger and renamer for Lidarr" \
+      org.opencontainers.image.licenses="MIT"
+
 # fpcalc (Chromaprint) does the acoustic fingerprinting
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libchromaprint-tools \
