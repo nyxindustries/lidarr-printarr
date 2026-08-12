@@ -252,7 +252,9 @@ def _retry_after_seconds(header: str | None, fallback: float) -> float:
                          - datetime.now(UTC)).total_seconds()
             except (TypeError, ValueError):
                 pass  # unparseable header: keep the fallback backoff
-    return max(0.0, min(delay, 60.0))
+    # A 503/429 means "slow down" — never retry faster than 1s even when the
+    # server sends Retry-After: 0
+    return max(1.0, min(delay, 60.0))
 
 
 def _escape_lucene(text: str) -> str:
