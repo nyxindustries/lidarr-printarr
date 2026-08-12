@@ -90,6 +90,15 @@ class WatchConfig:
 
 
 @dataclass
+class WebConfig:
+    # Review UI for downloads printarr refused to match automatically.
+    # No authentication — keep it on localhost or behind a reverse proxy.
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8687
+
+
+@dataclass
 class GeneralConfig:
     dry_run: bool = False
     log_level: str = "INFO"
@@ -106,6 +115,7 @@ class Config:
     renaming: RenamingConfig = field(default_factory=RenamingConfig)
     queue: QueueConfig = field(default_factory=QueueConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
+    web: WebConfig = field(default_factory=WebConfig)
     general: GeneralConfig = field(default_factory=GeneralConfig)
 
 

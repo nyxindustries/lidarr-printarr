@@ -55,6 +55,10 @@ instead. Mistagging a music library is worse than a manual import.
 - **Watch folders** independent of the queue, namer-style: a folder is picked
   up once it stops changing, processed, and optionally handed to Lidarr via
   `DownloadedAlbumsScan`.
+- **Review web UI** for everything printarr refused to match automatically:
+  see the candidates that were considered, pick the right one (or paste any
+  MusicBrainz URL), and printarr force-tags the folder and triggers the
+  import — namer's failed-dir web UI, adapted for Lidarr.
 - **Dry-run everything** (`--dry-run`, `printarr identify`) before letting it
   touch your files.
 - Path mappings for split-container setups, state file to avoid rework,
@@ -122,6 +126,26 @@ printarr --dry-run queue                              # see what would happen
 ```
 
 Global flags (`--dry-run`, `--config`, `--log-level`) go before the subcommand.
+
+## Review web UI
+
+Automatic matching deliberately refuses ambiguous results instead of guessing.
+The web UI is where those land for a human decision:
+
+```toml
+[web]
+enabled = true          # started automatically by `printarr watch`
+host = "127.0.0.1"      # "0.0.0.0" inside Docker
+port = 8687
+```
+
+It lists all stuck Lidarr downloads and failed watch folders together with the
+candidate releases printarr considered (scores, fingerprint hits, MusicBrainz
+links). One click on **Use this** — or pasting any MusicBrainz release or
+release-group URL — force-tags the folder with that release and triggers the
+Lidarr import. **Retry auto** re-runs automatic identification (MusicBrainz
+data improves over time). The UI has no authentication; keep it on localhost
+or behind a reverse proxy.
 
 `identify` output shows the per-file mapping, `♪` marking fingerprint-confirmed
 tracks:

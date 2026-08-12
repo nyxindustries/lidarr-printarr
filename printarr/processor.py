@@ -164,6 +164,54 @@ class Processor:
         match, report = choose_release(files, candidates, self.config.matching)
         return match, report, None
 
+    def _identify_forced(self, files: list[AudioFile],
+                         release_mbid: str | None = None,
+                         release_group_mbid: str | None = None,
+                         ) -> tuple[ReleaseMatch | None, MatchReport, None]:
+        """A human picked the release (or release group): assign tracks and
+        accept without confidence or ambiguity checks. A release group is
+        resolved to its best-fitting release by assignment score."""
+        from printarr.matching import assign_tracks
+
+        report = MatchReport()
+        candidates: list[MBRelease] = []
+        if release_mbid:
+            try:
+                candidates = [self.mb.release(release_mbid)]
+            except MusicBrainzError as exc:
+                report.reason = f"forced release lookup failed: {exc}"
+                return None, report, None
+        elif release_group_mbid:
+            candidates = self.candidates_from_release_group(release_group_mbid,
+                                                            len(files))
+            if not candidates:
+                report.reason = ("forced release group lookup returned no "
+                                 "usable releases")
+                return None, report, None
+
+        self.fingerprint(files)
+        matches = [assign_tracks(files, release, self.config.matching)
+                   for release in candidates]
+        matches = [m for m in matches if m.pairs]
+        if not matches:
+            report.reason = "forced release has no tracks matching these files"
+            return None, report, None
+        matches.sort(key=lambda m: (-m.score,
+                                    abs(len(m.release.tracks) - len(files))))
+        match = matches[0]
+        for m in matches:
+            report.candidates.append({
+                "release_id": m.release.id,
+                "title": m.release.title,
+                "artist": m.release.artist,
+                "score": round(m.score, 4),
+            })
+        if match.unmatched_files:
+            names = ", ".join(f.path.name for f in match.unmatched_files[:5])
+            log.warning("forced assignment leaves files unmatched: %s", names)
+        report.reason = "forced"
+        return match, report, None
+
     # --------------------------------------------------------------- enriching
 
     def enrich(self, match: ReleaseMatch) -> None:
@@ -262,7 +310,9 @@ class Processor:
 
     def process_folder(self, folder: Path,
                        lidarr_candidates: list[LidarrCandidate] | None = None,
-                       release_group_hint: str | None = None) -> ProcessResult:
+                       release_group_hint: str | None = None,
+                       forced_release_mbid: str | None = None,
+                       forced_release_group_mbid: str | None = None) -> ProcessResult:
         folder = folder.resolve()
         if not folder.exists():
             return ProcessResult(folder, False, reason=f"path does not exist: {folder}")
@@ -272,8 +322,12 @@ class Processor:
             return ProcessResult(folder, False, reason="no audio files found")
         log.info("processing %s (%d audio files)", folder, len(files))
 
-        match, report, chosen = self.identify(files, lidarr_candidates,
-                                              release_group_hint)
+        if forced_release_mbid or forced_release_group_mbid:
+            match, report, chosen = self._identify_forced(
+                files, forced_release_mbid, forced_release_group_mbid)
+        else:
+            match, report, chosen = self.identify(files, lidarr_candidates,
+                                                  release_group_hint)
         if match is None:
             log.warning("no confident match for %s: %s", folder, report.reason)
             self._write_report(folder, report, success=False)

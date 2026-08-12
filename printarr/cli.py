@@ -56,7 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("queue", help="fix all stuck items in the Lidarr queue once")
     sub.add_parser("watch", help="run continuously: poll the Lidarr queue and "
-                                 "process watch folders")
+                                 "process watch folders (starts the web UI when "
+                                 "web.enabled is set)")
+    sub.add_parser("web", help="serve only the review web UI for manual "
+                               "match assignment")
     return parser
 
 
@@ -129,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Lidarr scan triggered")
             return code
 
-        if args.command in ("queue", "watch"):
+        if args.command in ("queue", "watch", "web"):
             validate_for_lidarr(config)
             processor = _make_processor(config)
             lidarr = LidarrClient(config.lidarr.url, config.lidarr.api_key,
@@ -145,6 +148,13 @@ def main(argv: list[str] | None = None) -> int:
                     status = "ok" if outcome.success else "FAILED"
                     print(f"[{status}] {outcome.title}: {outcome.reason}")
                 return 0 if all(o.success for o in outcomes) else 1
+
+            from printarr.webui import WebUI
+            if args.command == "web":
+                WebUI(config, worker).serve_forever()
+                return 0
+            if config.web.enabled:
+                WebUI(config, worker).start_background()
             worker.watch()
             return 0
     except ConfigError as exc:

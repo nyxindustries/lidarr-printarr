@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -83,6 +84,7 @@ class StateStore:
 
     def __init__(self, path: str):
         self.path = Path(path) if path else None
+        self._lock = threading.Lock()
         self.data: dict = {"queue": {}, "folders": {}}
         if self.path and self.path.is_file():
             try:
@@ -119,11 +121,21 @@ class StateStore:
             return True
         return (time.time() - entry.get("at", 0)) < cooldown
 
-    def record_download(self, download_id: str, outcome: str, reason: str = "") -> None:
-        self.data["queue"][download_id] = {
-            "at": time.time(), "outcome": outcome, "reason": reason,
-        }
-        self.save()
+    def record_download(self, download_id: str, outcome: str, reason: str = "",
+                       title: str = "", path: str = "") -> None:
+        with self._lock:
+            entry = {"at": time.time(), "outcome": outcome, "reason": reason}
+            if title:
+                entry["title"] = title
+            if path:
+                entry["path"] = path
+            self.data["queue"][download_id] = entry
+            self.save()
+
+    def clear_download(self, download_id: str) -> None:
+        with self._lock:
+            if self.data["queue"].pop(download_id, None) is not None:
+                self.save()
 
     def should_skip_folder(self, key: str, cooldown: int) -> bool:
         entry = self.data["folders"].get(key)
@@ -134,10 +146,16 @@ class StateStore:
         return (time.time() - entry.get("at", 0)) < cooldown
 
     def record_folder(self, key: str, outcome: str, reason: str = "") -> None:
-        self.data["folders"][key] = {
-            "at": time.time(), "outcome": outcome, "reason": reason,
-        }
-        self.save()
+        with self._lock:
+            self.data["folders"][key] = {
+                "at": time.time(), "outcome": outcome, "reason": reason,
+            }
+            self.save()
+
+    def clear_folder(self, key: str) -> None:
+        with self._lock:
+            if self.data["folders"].pop(key, None) is not None:
+                self.save()
 
 
 class QueueWorker:
@@ -151,6 +169,8 @@ class QueueWorker:
             # Keep outcomes in memory (so dry-run watch loops don't reprocess
             # everything each cycle) but never persist them
             self.state.path = None
+        # Serializes folder processing between the watch loop and the web UI
+        self.process_lock = threading.Lock()
 
     # ------------------------------------------------------------- queue pass
 
@@ -162,7 +182,8 @@ class QueueWorker:
         outcomes = []
         for record in stuck:
             try:
-                outcome = self._handle_record(record)
+                with self.process_lock:
+                    outcome = self._handle_record(record)
             except Exception as exc:
                 # One poisoned item must not abort the pass or dodge the cooldown
                 title = record.get("title", "?")
@@ -170,7 +191,7 @@ class QueueWorker:
                 download_id = record.get("downloadId") or ""
                 if download_id:
                     self.state.record_download(download_id, "failed",
-                                               f"unexpected error: {exc}")
+                                               f"unexpected error: {exc}", title=title)
                 outcome = QueueOutcome(download_id, title, False,
                                        f"unexpected error: {exc}")
             if outcome is not None:
@@ -194,7 +215,8 @@ class QueueWorker:
         if not local_path.exists():
             return self._fail(
                 download_id, title,
-                f"path not accessible: {local_path} (configure queue.path_mappings?)")
+                f"path not accessible: {local_path} (configure queue.path_mappings?)",
+                path=str(local_path))
 
         log.info("handling stuck download: %s (%s)", title,
                  record.get("trackedDownloadState"))
@@ -216,23 +238,27 @@ class QueueWorker:
 
         result = self.processor.process_folder(local_path, lidarr_candidates=candidates)
         if not result.success:
-            return self._fail(download_id, title, result.reason)
+            return self._fail(download_id, title, result.reason, path=str(local_path))
 
         if self.config.general.dry_run:
             log.info("[dry-run] would trigger Lidarr import for %s", title)
-            self.state.record_download(download_id, "dry-run", "dry run")
+            self.state.record_download(download_id, "dry-run", "dry run",
+                                       title=title, path=str(local_path))
             return QueueOutcome(download_id, title, True, "dry run")
 
         triggered, reason = self._trigger_import(record, result)
         outcome = "imported" if triggered else "import-failed"
-        self.state.record_download(download_id, outcome, reason)
+        self.state.record_download(download_id, outcome, reason,
+                                   title=title, path=str(local_path))
         return QueueOutcome(download_id, title, triggered, reason,
                             import_triggered=triggered)
 
-    def _fail(self, download_id: str, title: str, reason: str) -> QueueOutcome:
+    def _fail(self, download_id: str, title: str, reason: str,
+              path: str = "") -> QueueOutcome:
         # In dry-run mode the StateStore is in-memory only, so recording is safe
         log.warning("%s: %s", title, reason)
-        self.state.record_download(download_id, "failed", reason)
+        self.state.record_download(download_id, "failed", reason,
+                                   title=title, path=path)
         return QueueOutcome(download_id, title, False, reason)
 
     # ---------------------------------------------------------------- imports
@@ -364,6 +390,10 @@ class QueueWorker:
         return newest
 
     def _process_watch_child(self, child: Path) -> None:
+        with self.process_lock:
+            self._process_watch_child_locked(child)
+
+    def _process_watch_child_locked(self, child: Path) -> None:
         key = str(child.resolve())
         if self.state.should_skip_folder(key, self.config.queue.retry_cooldown):
             return
@@ -394,6 +424,157 @@ class QueueWorker:
                 log.warning("scan trigger failed for %s: %s", child, exc)
         self.state.record_folder(key, "processed" if result.success else "failed",
                                  result.reason)
+
+    # ------------------------------------------------------- review UI support
+
+    def list_review_items(self) -> dict:
+        """Stuck queue items and failed watch folders, with their candidate
+        tables from the per-folder report files. Feeds the web UI."""
+        queue_items: list[dict] = []
+        error = ""
+        try:
+            records = self.lidarr.queue()
+        except LidarrError as exc:
+            records = []
+            error = str(exc)
+        for record in records:
+            if not self.lidarr.is_stuck(record):
+                continue
+            download_id = record.get("downloadId") or ""
+            local = self.mapper.to_local(record.get("outputPath") or "")
+            entry = self.state.data["queue"].get(download_id, {})
+            queue_items.append({
+                "download_id": download_id,
+                "title": record.get("title", "?"),
+                "state": record.get("trackedDownloadState", ""),
+                "messages": [m.get("title", "") for m in
+                             (record.get("statusMessages") or [])],
+                "outcome": entry.get("outcome", ""),
+                "reason": entry.get("reason", ""),
+                "path": str(local),
+                "exists": local.exists(),
+                "candidates": self._read_report(local),
+            })
+
+        folders: list[dict] = []
+        for key, entry in list(self.state.data["folders"].items()):
+            if entry.get("outcome") != "failed":
+                continue
+            folder = Path(key)
+            if not folder.is_dir():
+                continue
+            folders.append({
+                "path": key,
+                "title": folder.name,
+                "reason": entry.get("reason", ""),
+                "candidates": self._read_report(folder),
+            })
+        return {"queue": queue_items, "folders": folders, "error": error}
+
+    @staticmethod
+    def _read_report(folder: Path) -> list[dict]:
+        from printarr.processor import REPORT_FILENAME
+        try:
+            data = json.loads((folder / REPORT_FILENAME).read_text())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return []
+        candidates = data.get("candidates", [])
+        return candidates if isinstance(candidates, list) else []
+
+    def assign_queue_item(self, download_id: str, release_mbid: str | None = None,
+                          release_group_mbid: str | None = None) -> tuple[bool, str]:
+        """Human-confirmed match for a stuck queue item: force-process, then
+        import via a folder scan (the fresh MusicBrainz tags make Lidarr's
+        matching deterministic)."""
+        with self.process_lock:
+            try:
+                records = self.lidarr.queue()
+            except LidarrError as exc:
+                return False, f"queue fetch failed: {exc}"
+            record = next((r for r in records
+                           if r.get("downloadId") == download_id), None)
+            if record is None:
+                self.state.clear_download(download_id)
+                return False, "queue item no longer exists in Lidarr"
+            title = record.get("title", "?")
+            local = self.mapper.to_local(record.get("outputPath") or "")
+            if not local.exists():
+                return False, f"path not accessible: {local}"
+
+            result = self.processor.process_folder(
+                local, forced_release_mbid=release_mbid,
+                forced_release_group_mbid=release_group_mbid)
+            if not result.success:
+                return False, result.reason
+            if self.config.general.dry_run:
+                return True, "dry run: matched, would trigger import"
+
+            triggered, reason = self._trigger_scan(record)
+            self.state.record_download(
+                download_id, "imported" if triggered else "import-failed",
+                reason, title=title, path=str(local))
+            return triggered, reason
+
+    def assign_folder(self, path: str, release_mbid: str | None = None,
+                      release_group_mbid: str | None = None) -> tuple[bool, str]:
+        """Human-confirmed match for a watch folder."""
+        with self.process_lock:
+            folder = Path(path)
+            if not folder.is_dir():
+                return False, f"not a folder: {path}"
+            key = str(folder.resolve())
+            result = self.processor.process_folder(
+                folder, forced_release_mbid=release_mbid,
+                forced_release_group_mbid=release_group_mbid)
+            if not result.success:
+                self.state.record_folder(key, "failed", result.reason)
+                return False, result.reason
+            if self.config.general.dry_run:
+                return True, "dry run: matched"
+            if self.config.watch.trigger_lidarr_scan:
+                remote = self.mapper.to_remote(key)
+                try:
+                    self.lidarr.trigger_downloaded_albums_scan(remote)
+                except LidarrError as exc:
+                    log.warning("scan trigger failed for %s: %s", folder, exc)
+            self.state.record_folder(key, "processed", "assigned manually")
+            return True, "processed"
+
+    def retry_queue_item(self, download_id: str) -> tuple[bool, str]:
+        """Re-run automatic identification for one stuck item right now."""
+        self.state.clear_download(download_id)
+        try:
+            records = self.lidarr.queue()
+        except LidarrError as exc:
+            return False, f"queue fetch failed: {exc}"
+        record = next((r for r in records
+                       if r.get("downloadId") == download_id), None)
+        if record is None:
+            return False, "queue item no longer exists in Lidarr"
+        try:
+            with self.process_lock:
+                outcome = self._handle_record(record)
+        except Exception as exc:
+            log.exception("retry failed for %s", download_id)
+            return False, f"unexpected error: {exc}"
+        if outcome is None:
+            return False, "item was skipped"
+        return outcome.success, outcome.reason
+
+    def retry_folder(self, path: str) -> tuple[bool, str]:
+        self.state.clear_folder(str(Path(path).resolve()))
+        folder = Path(path)
+        if not folder.is_dir():
+            return False, f"not a folder: {path}"
+        with self.process_lock:
+            result = self.processor.process_folder(folder)
+            key = str(folder.resolve())
+            if self.config.general.dry_run:
+                return result.success, result.reason or "dry run"
+            self.state.record_folder(key,
+                                     "processed" if result.success else "failed",
+                                     result.reason)
+        return result.success, result.reason
 
     # ------------------------------------------------------------------- watch
 
