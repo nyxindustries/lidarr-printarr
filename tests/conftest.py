@@ -33,6 +33,10 @@ def audio_factory(tmp_path_factory):
         ".m4a": ["-c:a", "aac", "-b:a", "128k"],
         ".ogg": ["-c:a", "libvorbis", "-q:a", "3"],
         ".opus": ["-c:a", "libopus", "-b:a", "96k"],
+        ".oga": ["-c:a", "flac", "-f", "ogg"],  # Ogg FLAC, not Vorbis
+        ".wav": ["-c:a", "pcm_s16le"],
+        ".aiff": ["-c:a", "pcm_s16be"],
+        ".wma": ["-c:a", "wmav2", "-b:a", "128k"],
     }
 
     def make(filename: str, seconds: float = 6.0, dest_dir: Path | None = None) -> Path:

@@ -86,8 +86,11 @@ class Processor:
         if not voting_files:
             return []
         # A plausible release must cover at least half the files that voted
-        threshold = max(1, voting_files // 2)
-        ranked = [mbid for mbid, count in votes.most_common() if count >= threshold]
+        threshold = (voting_files + 1) // 2
+        # Deterministic order: vote count desc, then MBID, so ties at the
+        # candidate cap cannot flip between runs
+        ranked = sorted((mbid for mbid, count in votes.items() if count >= threshold),
+                        key=lambda mbid: (-votes[mbid], mbid))
         candidates: list[MBRelease] = []
         for mbid in ranked[: self.config.matching.max_release_candidates]:
             try:
@@ -164,7 +167,11 @@ class Processor:
     # --------------------------------------------------------------- enriching
 
     def enrich(self, match: ReleaseMatch) -> None:
-        """Swap a Lidarr-derived release for full MusicBrainz metadata before tagging."""
+        """Swap a Lidarr-derived release for full MusicBrainz metadata before tagging.
+
+        pair.orig_track_id keeps the originally matched track MBID, which is
+        what the Lidarr import mapping is keyed on.
+        """
         try:
             full = self.mb.release(match.release.id)
         except MusicBrainzError as exc:
@@ -172,10 +179,19 @@ class Processor:
                         match.release.id, exc)
             return
         by_track_id = {track.id: track for track in full.tracks}
-        by_recording = {track.recording_id: track for track in full.tracks}
+        by_recording: dict[str, list] = {}
+        for track in full.tracks:
+            by_recording.setdefault(track.recording_id, []).append(track)
         for pair in match.pairs:
-            enriched = by_track_id.get(pair.track.id) or by_recording.get(
-                pair.track.recording_id)
+            pair.orig_track_id = pair.orig_track_id or pair.track.id
+            enriched = by_track_id.get(pair.track.id)
+            if enriched is None:
+                # Same recording can appear more than once; prefer the same slot
+                options = by_recording.get(pair.track.recording_id) or []
+                enriched = next(
+                    (t for t in options
+                     if (t.medium, t.position) == (pair.track.medium, pair.track.position)),
+                    options[0] if options else None)
             if enriched is not None:
                 pair.track = enriched
         match.release = full
@@ -199,13 +215,9 @@ class Processor:
                 log.info("[dry-run] would tag %s as %s - %s (track %d)",
                          pair.file.path.name, tags.artist, tags.title, tags.track)
                 continue
-            try:
-                write_tags(pair.file.path, tags, self.config.tagging,
-                           cover=cover, cover_mime=cover_mime)
-                tagged.append(pair.file.path)
-            except Exception as exc:
-                log.error("tagging failed for %s: %s", pair.file.path, exc)
-                raise
+            write_tags(pair.file.path, tags, self.config.tagging,
+                       cover=cover, cover_mime=cover_mime)
+            tagged.append(pair.file.path)
         return tagged
 
     def rename(self, match: ReleaseMatch) -> dict[str, str]:
@@ -216,6 +228,9 @@ class Processor:
                     else self.config.renaming.file_template)
         plans: list[RenamePlan] = []
         taken: set[Path] = set()
+        # Files being renamed vacate their current names, so those names are
+        # free as targets (e.g. two swapped filenames must not collide).
+        vacating = {pair.file.path for pair in match.pairs}
         for pair in match.pairs:
             values = {
                 "track": pair.track.position,
@@ -227,7 +242,8 @@ class Processor:
                 "year": match.release.year,
             }
             new_name = format_template(template, values) + pair.file.path.suffix.lower()
-            target = unique_target(pair.file.path.with_name(new_name), taken)
+            target = unique_target(pair.file.path.with_name(new_name), taken,
+                                   vacated=vacating)
             taken.add(target)
             plans.append(RenamePlan(pair.file.path, target))
 
@@ -271,8 +287,20 @@ class Processor:
                  match.release.id, len(match.pairs), len(match.release.tracks),
                  match.score)
 
-        tagged = self.tag(match) if self.config.tagging.enabled else []
-        renamed = self.rename(match)
+        if not self.config.general.dry_run and folder.is_dir():
+            # Drop the report a previously refused attempt may have left behind
+            try:
+                (folder / REPORT_FILENAME).unlink(missing_ok=True)
+            except OSError as exc:
+                log.debug("could not remove stale report file: %s", exc)
+
+        try:
+            tagged = self.tag(match) if self.config.tagging.enabled else []
+            renamed = self.rename(match)
+        except Exception as exc:
+            log.error("tag/rename failed for %s: %s", folder, exc)
+            return ProcessResult(folder, False, reason=f"tag/rename failed: {exc}",
+                                 match=match, report=report, lidarr_candidate=chosen)
         return ProcessResult(folder, True, reason=report.reason, match=match,
                              report=report, tagged=tagged, renamed=renamed,
                              lidarr_candidate=chosen)

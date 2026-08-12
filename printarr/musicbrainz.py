@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -165,8 +167,8 @@ class MusicBrainzClient:
             if response.status_code == 404:
                 raise MusicBrainzError(f"not found: {path}")
             if response.status_code in (429, 503) or response.status_code >= 500:
-                retry_after = response.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else 2 ** attempt
+                delay = _retry_after_seconds(response.headers.get("Retry-After"),
+                                             fallback=2 ** attempt)
                 log.warning("MusicBrainz HTTP %d, waiting %.1fs", response.status_code, delay)
                 time.sleep(delay)
                 continue
@@ -236,6 +238,21 @@ class MusicBrainzClient:
             log.warning("cover art HTTP %d (%s)", response.status_code, url)
             return None
         return response.content
+
+
+def _retry_after_seconds(header: str | None, fallback: float) -> float:
+    """Parse a Retry-After header (seconds or HTTP-date), clamped to [0, 60]."""
+    delay = fallback
+    if header:
+        try:
+            delay = float(header)
+        except ValueError:
+            try:
+                delay = (parsedate_to_datetime(header)
+                         - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError):
+                pass  # unparseable header: keep the fallback backoff
+    return max(0.0, min(delay, 60.0))
 
 
 def _escape_lucene(text: str) -> str:

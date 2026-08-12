@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import tomllib
+import typing
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 
@@ -65,8 +66,6 @@ class RenamingConfig:
     file_template: str = "{track:02d} - {title}"
     # Prefix files with the disc number when a release has multiple discs
     multi_disc_template: str = "{disc}-{track:02d} - {title}"
-    rename_folders: bool = False
-    folder_template: str = "{artist} - {album} ({year})"
 
 
 @dataclass
@@ -110,7 +109,7 @@ class Config:
     general: GeneralConfig = field(default_factory=GeneralConfig)
 
 
-def _coerce(value: str, target_type: type):
+def _coerce(value: str, target_type):
     if target_type is bool:
         lowered = value.strip().lower()
         if lowered in ("1", "true", "yes", "on"):
@@ -118,34 +117,68 @@ def _coerce(value: str, target_type: type):
         if lowered in ("0", "false", "no", "off"):
             return False
         raise ConfigError(f"cannot interpret {value!r} as boolean")
-    if target_type is int:
-        return int(value)
-    if target_type is float:
-        return float(value)
+    try:
+        if target_type is int:
+            return int(value)
+        if target_type is float:
+            return float(value)
+    except ValueError:
+        raise ConfigError(
+            f"cannot interpret {value!r} as {target_type.__name__}") from None
     if target_type is list or target_type == list[str]:
         return [item.strip() for item in value.split(",") if item.strip()]
     return value
 
 
+def _check_type(value, target_type) -> bool:
+    """Validate a TOML value against a declared field type."""
+    if target_type is bool:
+        return isinstance(value, bool)
+    if target_type is int:
+        # bool subclasses int; poll_interval = true must be rejected
+        return isinstance(value, int) and not isinstance(value, bool)
+    if target_type is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if target_type is str:
+        return isinstance(value, str)
+    if target_type is list or target_type == list[str]:
+        return isinstance(value, list) and all(isinstance(v, str) for v in value)
+    return True
+
+
+def _type_name(target_type) -> str:
+    return getattr(target_type, "__name__", str(target_type))
+
+
 def _apply_dict(section_obj, data: dict, context: str) -> None:
-    valid = {f.name: f for f in fields(section_obj)}
+    valid = {f.name for f in fields(section_obj)}
+    hints = typing.get_type_hints(type(section_obj))
     for key, value in data.items():
         normalized = key.replace("-", "_")
         if normalized not in valid:
             raise ConfigError(f"unknown option '{key}' in [{context}]")
+        declared = hints[normalized]
+        if not _check_type(value, declared):
+            raise ConfigError(
+                f"[{context}].{key}: expected {_type_name(declared)}, "
+                f"got {type(value).__name__} ({value!r})")
+        if declared is float and isinstance(value, int):
+            value = float(value)
         setattr(section_obj, normalized, value)
 
 
 def _apply_env(config: Config, environ: dict[str, str]) -> None:
     sections = {f.name: getattr(config, f.name) for f in fields(config)}
     for section_name, section_obj in sections.items():
+        hints = typing.get_type_hints(type(section_obj))
         for f in fields(section_obj):
             env_key = f"PRINTARR_{section_name.upper()}_{f.name.upper()}"
             if env_key in environ:
-                # Defaults are always present and correctly typed, so the runtime
-                # type of the default tells us what to coerce the env string to.
-                target = type(getattr(section_obj, f.name))
-                setattr(section_obj, f.name, _coerce(environ[env_key], target))
+                try:
+                    coerced = _coerce(environ[env_key], hints[f.name])
+                except ConfigError as exc:
+                    raise ConfigError(f"invalid value for {env_key}: {exc}") from None
+                setattr(section_obj, f.name, coerced)
 
 
 def load_config(path: str | Path | None = None, environ: dict[str, str] | None = None) -> Config:

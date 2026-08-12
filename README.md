@@ -118,8 +118,10 @@ printarr process  /downloads/Weird.Release.2003-GRP   # fix tags + names in plac
 printarr process  --release-group <MBID> …            # with a release-group hint
 printarr queue                                        # fix all stuck queue items once
 printarr watch                                        # run continuously (daemon)
-printarr queue --dry-run                              # see what would happen
+printarr --dry-run queue                              # see what would happen
 ```
+
+Global flags (`--dry-run`, `--config`, `--log-level`) go before the subcommand.
 
 `identify` output shows the per-file mapping, `♪` marking fingerprint-confirmed
 tracks:

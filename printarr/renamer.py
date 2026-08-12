@@ -58,30 +58,59 @@ class RenamePlan:
         return self.source == self.target
 
 
-def unique_target(target: Path, taken: set[Path]) -> Path:
-    """Avoid overwriting: suffix ' (1)', ' (2)', ... before the extension."""
-    if target not in taken and not target.exists():
+def unique_target(target: Path, taken: set[Path],
+                  vacated: set[Path] | None = None) -> Path:
+    """Avoid overwriting: suffix ' (1)', ' (2)', ... before the extension.
+
+    Paths in `vacated` belong to files that are being renamed away in the same
+    batch, so they do not count as collisions (unless already claimed via
+    `taken`).
+    """
+    vacated = vacated or set()
+
+    def free(candidate: Path) -> bool:
+        if candidate in taken:
+            return False
+        return candidate in vacated or not candidate.exists()
+
+    if free(target):
         return target
     stem, suffix = target.stem, target.suffix
     for counter in range(1, 100):
         candidate = target.with_name(f"{stem} ({counter}){suffix}")
-        if candidate not in taken and not candidate.exists():
+        if free(candidate):
             return candidate
     raise TemplateError(f"cannot find a free name for {target}")
 
 
 def apply_renames(plans: list[RenamePlan], dry_run: bool = False) -> list[RenamePlan]:
-    """Execute rename plans; returns the plans actually applied."""
-    applied: list[RenamePlan] = []
-    for plan in plans:
-        if plan.is_noop:
-            continue
-        if dry_run:
+    """Execute rename plans; returns the plans actually applied.
+
+    When a plan's target is another plan's source (swapped or shifted track
+    numbers), renames happen in two phases via temporary names — Path.rename
+    would otherwise silently overwrite the not-yet-moved file on POSIX.
+    """
+    pending = [plan for plan in plans if not plan.is_noop]
+    if dry_run:
+        for plan in pending:
             log.info("[dry-run] would rename %s -> %s", plan.source, plan.target)
-            applied.append(plan)
-            continue
+        return pending
+
+    sources = {plan.source for plan in pending}
+    overlapping = any(plan.target in sources for plan in pending)
+
+    staged: list[tuple[RenamePlan, Path]] = []
+    if overlapping:
+        for index, plan in enumerate(pending):
+            temp = plan.source.with_name(
+                f".printarr-tmp-{index}{plan.source.suffix}")
+            plan.source.rename(temp)
+            staged.append((plan, temp))
+    else:
+        staged = [(plan, plan.source) for plan in pending]
+
+    for plan, current in staged:
         plan.target.parent.mkdir(parents=True, exist_ok=True)
-        plan.source.rename(plan.target)
+        current.rename(plan.target)
         log.info("renamed %s -> %s", plan.source.name, plan.target.name)
-        applied.append(plan)
-    return applied
+    return pending

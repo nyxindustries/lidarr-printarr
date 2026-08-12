@@ -12,6 +12,7 @@ Queue flow per stuck item:
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -85,7 +86,11 @@ class StateStore:
         self.data: dict = {"queue": {}, "folders": {}}
         if self.path and self.path.is_file():
             try:
-                self.data = json.loads(self.path.read_text())
+                loaded = json.loads(self.path.read_text())
+                if isinstance(loaded, dict):
+                    self.data = loaded
+                else:
+                    log.warning("state file %s is not a JSON object, ignoring", self.path)
             except (OSError, json.JSONDecodeError) as exc:
                 log.warning("could not read state file %s: %s", self.path, exc)
         self.data.setdefault("queue", {})
@@ -94,10 +99,17 @@ class StateStore:
     def save(self) -> None:
         if not self.path:
             return
+        # Atomic replace so a crash mid-write cannot corrupt the state file
+        temp = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
-            self.path.write_text(json.dumps(self.data, indent=2))
+            with open(temp, "w") as fh:
+                json.dump(self.data, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp, self.path)
         except OSError as exc:
             log.warning("could not write state file %s: %s", self.path, exc)
+            temp.unlink(missing_ok=True)
 
     def should_skip_download(self, download_id: str, cooldown: int) -> bool:
         entry = self.data["queue"].get(download_id)
@@ -135,21 +147,32 @@ class QueueWorker:
         self.processor = processor
         self.mapper = PathMapper(config.queue.path_mappings)
         self.state = StateStore(config.general.state_file)
+        if config.general.dry_run:
+            # Keep outcomes in memory (so dry-run watch loops don't reprocess
+            # everything each cycle) but never persist them
+            self.state.path = None
 
     # ------------------------------------------------------------- queue pass
 
     def run_once(self) -> list[QueueOutcome]:
-        try:
-            records = self.lidarr.queue()
-        except LidarrError as exc:
-            log.error("could not fetch Lidarr queue: %s", exc)
-            return []
-
+        """One pass over the queue. Raises LidarrError if the queue fetch fails."""
+        records = self.lidarr.queue()
         stuck = [r for r in records if self.lidarr.is_stuck(r)]
         log.info("queue: %d items, %d stuck", len(records), len(stuck))
         outcomes = []
         for record in stuck:
-            outcome = self._handle_record(record)
+            try:
+                outcome = self._handle_record(record)
+            except Exception as exc:
+                # One poisoned item must not abort the pass or dodge the cooldown
+                title = record.get("title", "?")
+                log.exception("unexpected error handling %s", title)
+                download_id = record.get("downloadId") or ""
+                if download_id:
+                    self.state.record_download(download_id, "failed",
+                                               f"unexpected error: {exc}")
+                outcome = QueueOutcome(download_id, title, False,
+                                       f"unexpected error: {exc}")
             if outcome is not None:
                 outcomes.append(outcome)
         return outcomes
@@ -197,6 +220,7 @@ class QueueWorker:
 
         if self.config.general.dry_run:
             log.info("[dry-run] would trigger Lidarr import for %s", title)
+            self.state.record_download(download_id, "dry-run", "dry run")
             return QueueOutcome(download_id, title, True, "dry run")
 
         triggered, reason = self._trigger_import(record, result)
@@ -206,9 +230,9 @@ class QueueWorker:
                             import_triggered=triggered)
 
     def _fail(self, download_id: str, title: str, reason: str) -> QueueOutcome:
+        # In dry-run mode the StateStore is in-memory only, so recording is safe
         log.warning("%s: %s", title, reason)
-        if not self.config.general.dry_run:
-            self.state.record_download(download_id, "failed", reason)
+        self.state.record_download(download_id, "failed", reason)
         return QueueOutcome(download_id, title, False, reason)
 
     # ---------------------------------------------------------------- imports
@@ -230,7 +254,15 @@ class QueueWorker:
         by_local_path: dict[str, dict] = {}
         for item in items:
             item_path = item.get("path") or ""
-            by_local_path[str(self.mapper.to_local(item_path))] = item
+            local = self.mapper.to_local(item_path)
+            try:
+                # pair.file.path is resolved (process_folder resolves the
+                # folder), so canonicalize this side too or symlinked download
+                # dirs never match
+                key = str(local.resolve())
+            except OSError:
+                key = str(local)
+            by_local_path[key] = item
 
         files = []
         for pair in result.match.pairs:
@@ -239,7 +271,8 @@ class QueueWorker:
                 log.warning("file missing from manualimport listing: %s",
                             pair.file.path.name)
                 continue
-            db_track_id = candidate.db_track_ids.get(pair.track.id)
+            db_track_id = candidate.db_track_ids.get(
+                pair.orig_track_id or pair.track.id)
             if db_track_id is None:
                 log.warning("no Lidarr track id for %s", pair.track.title)
                 continue
@@ -256,6 +289,9 @@ class QueueWorker:
             })
 
         if not files:
+            log.warning("no manualimport items matched the processed files for %s "
+                        "— falling back to a folder scan (path mapping mismatch?)",
+                        record.get("title", ""))
             return self._trigger_scan(record)
 
         try:
@@ -266,22 +302,46 @@ class QueueWorker:
             return False, f"ManualImport command failed: {exc}"
         if status.get("status") != "completed":
             return False, f"ManualImport ended with status {status.get('status')}"
-        log.info("import triggered for %d file(s): %s", len(files),
+        # A "completed" command does not mean the files imported — Lidarr
+        # swallows per-file failures. Only the queue tells the truth.
+        if not self._import_verified(download_id):
+            return False, "queue item still stuck after ManualImport"
+        log.info("import verified for %d file(s): %s", len(files),
                  record.get("title", ""))
         return True, f"imported {len(files)} file(s)"
 
     def _trigger_scan(self, record: dict) -> tuple[bool, str]:
         output_path = record.get("outputPath") or ""
+        download_id = record.get("downloadId") or ""
         try:
             command = self.lidarr.trigger_downloaded_albums_scan(
-                output_path, download_client_id=record.get("downloadId"),
+                output_path, download_client_id=download_id,
                 import_mode=self.config.queue.import_mode)
             status = self.lidarr.wait_for_command(command.get("id"))
         except LidarrError as exc:
             return False, f"DownloadedAlbumsScan failed: {exc}"
         if status.get("status") != "completed":
             return False, f"scan ended with status {status.get('status')}"
-        return True, "DownloadedAlbumsScan triggered"
+        if str(status.get("result", "")).lower() == "unsuccessful":
+            return False, "DownloadedAlbumsScan imported nothing"
+        if download_id and not self._import_verified(download_id):
+            return False, "queue item still stuck after DownloadedAlbumsScan"
+        return True, "DownloadedAlbumsScan imported the download"
+
+    def _import_verified(self, download_id: str, settle_seconds: float = 3.0) -> bool:
+        """True when the queue item is gone or no longer stuck after an import."""
+        time.sleep(settle_seconds)  # Lidarr refreshes tracked downloads async
+        try:
+            records = self.lidarr.queue()
+        except LidarrError as exc:
+            log.warning("could not verify import of %s: %s", download_id, exc)
+            # Unverifiable counts as failure: the cooldown retry is benign,
+            # wrongly recording "imported" abandons the item forever
+            return False
+        for record in records:
+            if record.get("downloadId") == download_id:
+                return not self.lidarr.is_stuck(record)
+        return True
 
     # ----------------------------------------------------------- watch folders
 
@@ -307,13 +367,24 @@ class QueueWorker:
         key = str(child.resolve())
         if self.state.should_skip_folder(key, self.config.queue.retry_cooldown):
             return
-        quiet_for = time.time() - self._newest_mtime(child)
+        try:
+            quiet_for = time.time() - self._newest_mtime(child)
+        except OSError as exc:
+            log.debug("watch child vanished before processing: %s (%s)", child, exc)
+            return
         if quiet_for < self.config.watch.quiet_seconds:
             log.debug("folder still settling: %s", child)
             return
-        result = self.processor.process_folder(child)
+        try:
+            result = self.processor.process_folder(child)
+        except Exception as exc:
+            log.exception("unexpected error processing %s", child)
+            self.state.record_folder(key, "failed", f"unexpected error: {exc}")
+            return
         if self.config.general.dry_run:
-            # Dry runs must not persist state or trigger scans
+            # State is in-memory in dry-run mode; never trigger Lidarr actions
+            self.state.record_folder(key, "processed" if result.success else "failed",
+                                     result.reason)
             return
         if result.success and self.config.watch.trigger_lidarr_scan:
             remote = self.mapper.to_remote(str(child))

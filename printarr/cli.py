@@ -14,7 +14,7 @@ from printarr.config import (
     validate_for_lidarr,
 )
 from printarr.fingerprint import AcoustidClient
-from printarr.lidarr import LidarrClient
+from printarr.lidarr import LidarrClient, LidarrError
 from printarr.log import get_logger, setup_logging
 from printarr.musicbrainz import MusicBrainzClient
 from printarr.processor import Processor
@@ -136,7 +136,11 @@ def main(argv: list[str] | None = None) -> int:
                                   verify_ssl=config.lidarr.verify_ssl)
             worker = QueueWorker(config, lidarr, processor)
             if args.command == "queue":
-                outcomes = worker.run_once()
+                try:
+                    outcomes = worker.run_once()
+                except LidarrError as exc:
+                    print(f"could not fetch Lidarr queue: {exc}", file=sys.stderr)
+                    return 1
                 for outcome in outcomes:
                     status = "ok" if outcome.success else "FAILED"
                     print(f"[{status}] {outcome.title}: {outcome.reason}")

@@ -19,8 +19,8 @@ from printarr.musicbrainz import MBRelease, MBTrack
 
 log = get_logger(__name__)
 
-# Two releases closer than this in score are considered ambiguous unless the
-# runner-up is a different pressing of the same release group.
+# Candidates closer than this to the best score are considered ambiguous,
+# unless they are just other pressings of the same release group.
 AMBIGUITY_MARGIN = 0.05
 
 
@@ -30,6 +30,9 @@ class Pair:
     track: MBTrack
     score: float
     fingerprint_matched: bool
+    # Track MBID as originally matched, before enrich() may swap the track
+    # object — the Lidarr import mapping is keyed on this id.
+    orig_track_id: str = ""
 
 
 @dataclass
@@ -82,26 +85,80 @@ def score_pair(file: AudioFile, track: MBTrack, config: MatchingConfig) -> tuple
 
 def assign_tracks(files: list[AudioFile], release: MBRelease,
                   config: MatchingConfig) -> ReleaseMatch:
-    """Greedy one-to-one assignment of files to tracks, best scores first."""
+    """One-to-one assignment of files to tracks.
+
+    A greedy pass (best scores first) seeds the assignment; unmatched files
+    then get a Kuhn-style augmenting-path pass so tied scores cannot strand a
+    file that a different pairing order would have matched.
+    """
+    edges: dict[int, list[tuple[float, bool, int]]] = {}
     scored: list[tuple[float, bool, int, int]] = []
     for f_idx, file in enumerate(files):
         for t_idx, track in enumerate(release.tracks):
             score, fp = score_pair(file, track, config)
             if score > 0.1:
                 scored.append((score, fp, f_idx, t_idx))
+                edges.setdefault(f_idx, []).append((score, fp, t_idx))
     scored.sort(key=lambda item: (-item[0], item[2], item[3]))
+    for candidates in edges.values():
+        candidates.sort(key=lambda item: -item[0])
 
-    used_files: set[int] = set()
-    used_tracks: set[int] = set()
-    pairs: list[Pair] = []
+    # track index -> (file index, score, fingerprint matched)
+    assignment: dict[int, tuple[int, float, bool]] = {}
+    assigned_files: set[int] = set()
     for score, fp, f_idx, t_idx in scored:
-        if f_idx in used_files or t_idx in used_tracks:
+        if f_idx in assigned_files or t_idx in assignment:
             continue
-        used_files.add(f_idx)
-        used_tracks.add(t_idx)
-        pairs.append(Pair(files[f_idx], release.tracks[t_idx], score, fp))
+        assigned_files.add(f_idx)
+        assignment[t_idx] = (f_idx, score, fp)
 
-    unmatched = [f for idx, f in enumerate(files) if idx not in used_files]
+    def try_augment(f_idx: int, visited: set[int]) -> bool:
+        for score, fp, t_idx in edges.get(f_idx, []):
+            if t_idx in visited:
+                continue
+            visited.add(t_idx)
+            holder = assignment.get(t_idx)
+            if holder is None or try_augment(holder[0], visited):
+                assignment[t_idx] = (f_idx, score, fp)
+                return True
+        return False
+
+    for f_idx in range(len(files)):
+        if f_idx not in assigned_files and try_augment(f_idx, set()):
+            assigned_files.add(f_idx)
+
+    # 2-opt improvement: greedy tie-breaking can leave a fingerprint-confirmed
+    # pairing on the table (file A grabs B's track, B falls back to a weak
+    # duration match). Swap assignments while the total score improves.
+    edge: dict[tuple[int, int], tuple[float, bool]] = {
+        (f_idx, t_idx): (score, fp)
+        for f_idx, candidates in edges.items()
+        for score, fp, t_idx in candidates
+    }
+    improved = True
+    rounds = 0
+    while improved and rounds < len(files) * len(files) + 1:
+        improved = False
+        rounds += 1
+        assigned = list(assignment.items())
+        for i in range(len(assigned)):
+            for j in range(i + 1, len(assigned)):
+                t1, (f1, s1, _) = assigned[i]
+                t2, (f2, s2, _) = assigned[j]
+                alt1 = edge.get((f1, t2))
+                alt2 = edge.get((f2, t1))
+                if alt1 and alt2 and alt1[0] + alt2[0] > s1 + s2 + 1e-9:
+                    assignment[t2] = (f1, alt1[0], alt1[1])
+                    assignment[t1] = (f2, alt2[0], alt2[1])
+                    improved = True
+                    break
+            if improved:
+                break
+
+    pairs = [Pair(files[f_idx], release.tracks[t_idx], score, fp,
+                  orig_track_id=release.tracks[t_idx].id)
+             for t_idx, (f_idx, score, fp) in assignment.items()]
+    unmatched = [f for idx, f in enumerate(files) if idx not in assigned_files]
     pairs.sort(key=lambda p: (p.track.medium, p.track.position))
     return ReleaseMatch(release, pairs, unmatched, _release_score(files, release, pairs))
 
@@ -154,10 +211,10 @@ def choose_release(files: list[AudioFile], candidates: list[MBRelease],
         report.reason = f"unmatched files remain ({names})"
         return None, report
 
-    if len(matches) > 1:
-        runner_up = matches[1]
-        same_group = runner_up.release.release_group_id == best.release.release_group_id
-        if not same_group and best.score - runner_up.score < AMBIGUITY_MARGIN:
+    for runner_up in matches[1:]:
+        if best.score - runner_up.score >= AMBIGUITY_MARGIN:
+            break  # sorted by score; everything after is farther away
+        if runner_up.release.release_group_id != best.release.release_group_id:
             report.reason = (f"ambiguous: '{best.release.title}' ({best.score:.2f}) vs "
                              f"'{runner_up.release.title}' ({runner_up.score:.2f})")
             return None, report

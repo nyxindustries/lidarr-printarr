@@ -68,6 +68,29 @@ def _first(tags, key: str) -> str:
     return str(value).strip()
 
 
+# Easy-interface keys don't exist on raw ID3 (WAV/AIFF chunks) or ASF (WMA)
+# tag dicts, so those formats get their own key maps.
+_ID3_KEYS = {"title": "TIT2", "artist": "TPE1", "album": "TALB",
+             "albumartist": "TPE2", "tracknumber": "TRCK", "discnumber": "TPOS"}
+_ASF_KEYS = {"title": "title", "artist": "author", "album": "wm/albumtitle",
+             "albumartist": "wm/albumartist", "tracknumber": "wm/tracknumber",
+             "discnumber": "wm/partofset"}
+
+
+def _tag_hints(tags) -> dict[str, str]:
+    import mutagen.asf
+    import mutagen.id3
+
+    if isinstance(tags, mutagen.id3.ID3):
+        return {name: _first(tags, frame) for name, frame in _ID3_KEYS.items()}
+    if isinstance(tags, mutagen.asf.ASFTags):
+        lowered = {key.lower(): value for key, value in tags.items()}
+        return {name: _first(lowered, key) for name, key in _ASF_KEYS.items()}
+    return {name: _first(tags, name)
+            for name in ("title", "artist", "album", "albumartist",
+                         "tracknumber", "discnumber")}
+
+
 def _parse_number(raw: str) -> int | None:
     # Tag values like "3", "3/12" or "03"
     match = re.match(r"\s*(\d+)", raw)
@@ -101,19 +124,19 @@ def read_audio_file(path: Path) -> AudioFile | None:
 
     info = getattr(parsed, "info", None)
     duration = float(getattr(info, "length", 0.0) or 0.0)
-    tags = parsed.tags or {}
+    hints = _tag_hints(parsed.tags or {})
 
     disc_hint, track_hint = parse_filename_numbers(path.stem)
     audio = AudioFile(
         path=path,
         duration=duration,
         size=path.stat().st_size,
-        tag_title=_first(tags, "title"),
-        tag_artist=_first(tags, "artist"),
-        tag_album=_first(tags, "album"),
-        tag_albumartist=_first(tags, "albumartist"),
-        tag_track=_parse_number(_first(tags, "tracknumber")),
-        tag_disc=_parse_number(_first(tags, "discnumber")),
+        tag_title=hints["title"],
+        tag_artist=hints["artist"],
+        tag_album=hints["album"],
+        tag_albumartist=hints["albumartist"],
+        tag_track=_parse_number(hints["tracknumber"]),
+        tag_disc=_parse_number(hints["discnumber"]),
         filename_track=track_hint,
         filename_disc=disc_hint,
     )

@@ -31,6 +31,7 @@ from mutagen.id3 import (
     ID3NoHeaderError,
 )
 from mutagen.mp4 import MP4, MP4Cover
+from mutagen.oggflac import OggFLAC
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 
@@ -115,10 +116,14 @@ def write_tags(path, tags: TrackTags, config: TaggingConfig,
         _write_flac(path, tags, config, cover, cover_mime)
     elif suffix == "mp3":
         _write_id3(path, tags, config, cover, cover_mime)
+    elif suffix in ("wav", "aiff", "aif"):
+        _write_id3_chunk(path, tags, config, cover, cover_mime)
     elif suffix in ("m4a", "m4b", "mp4"):
         _write_mp4(path, tags, config, cover, cover_mime)
     elif suffix in ("ogg", "oga", "opus"):
-        _write_ogg(path, tags, config, cover, cover_mime, opus=suffix == "opus")
+        _write_ogg(path, tags, config, cover, cover_mime)
+    elif suffix in ("wma", "asf"):
+        _write_asf(path, tags, config)
     else:
         _write_generic(path, tags)
 
@@ -162,9 +167,15 @@ def _vorbis_fields(tags: TrackTags) -> dict[str, list[str]]:
     return {key: value for key, value in fields.items() if value and value[0]}
 
 
-def _apply_vorbis(audio, tags: TrackTags, config: TaggingConfig) -> None:
+def _apply_vorbis(audio, tags: TrackTags, config: TaggingConfig,
+                  keep_keys: tuple[str, ...] = ()) -> None:
     if config.clear_existing_tags and audio.tags is not None:
+        # Keep cover-art keys unless a replacement will overwrite them anyway
+        preserved = {key: audio[key] for key in list(audio.keys())
+                     if key.upper() in keep_keys}
         audio.tags.clear()
+        for key, value in preserved.items():
+            audio[key] = value
     fields = _vorbis_fields(tags)
     # Drop stale variants of the fields we are about to write
     for key in list(audio.keys()):
@@ -187,9 +198,14 @@ def _write_flac(path, tags, config, cover, cover_mime) -> None:
     audio.save()
 
 
-def _write_ogg(path, tags, config, cover, cover_mime, opus: bool) -> None:
-    audio = OggOpus(path) if opus else OggVorbis(path)
-    _apply_vorbis(audio, tags, config)
+def _write_ogg(path, tags, config, cover, cover_mime) -> None:
+    # The suffix does not identify the codec (.oga can be Ogg FLAC);
+    # let mutagen sniff the actual stream type.
+    audio = mutagen.File(path)
+    if not isinstance(audio, (OggVorbis, OggOpus, OggFLAC)):
+        raise TaggingError(f"unrecognized Ogg stream in {path}")
+    _apply_vorbis(audio, tags, config,
+                  keep_keys=("METADATA_BLOCK_PICTURE", "COVERART", "COVERARTMIME"))
     if cover and config.write_cover_art:
         import base64
 
@@ -210,8 +226,29 @@ def _write_id3(path, tags: TrackTags, config: TaggingConfig, cover, cover_mime) 
         id3 = ID3(path)
     except ID3NoHeaderError:
         id3 = ID3()
+    _apply_id3_frames(id3, tags, config, cover, cover_mime)
+    id3.save(path, v2_version=4)
+
+
+def _write_id3_chunk(path, tags: TrackTags, config: TaggingConfig,
+                     cover, cover_mime) -> None:
+    """WAV and AIFF carry ID3 tags in a RIFF/IFF chunk."""
+    audio = mutagen.File(path)
+    if audio is None:
+        raise TaggingError(f"unsupported format: {path}")
+    if audio.tags is None:
+        audio.add_tags()
+    _apply_id3_frames(audio.tags, tags, config, cover, cover_mime)
+    audio.save()
+
+
+def _apply_id3_frames(id3, tags: TrackTags, config: TaggingConfig,
+                      cover, cover_mime) -> None:
     if config.clear_existing_tags:
+        existing_covers = id3.getall("APIC")
         id3.clear()
+        for frame in existing_covers:
+            id3.add(frame)
 
     id3.add(TIT2(encoding=3, text=[tags.title]))
     id3.add(TPE1(encoding=3, text=[tags.artist]))
@@ -256,8 +293,6 @@ def _write_id3(path, tags: TrackTags, config: TaggingConfig, cover, cover_mime) 
         id3.delall("APIC")
         id3.add(APIC(encoding=3, mime=cover_mime, type=3, desc="", data=cover))
 
-    id3.save(path, v2_version=4)
-
 
 # ------------------------------------------------------------------------- MP4
 
@@ -267,7 +302,10 @@ _MP4_FREEFORM_PREFIX = "----:com.apple.iTunes:"
 def _write_mp4(path, tags: TrackTags, config: TaggingConfig, cover, cover_mime) -> None:
     audio = MP4(path)
     if config.clear_existing_tags and audio.tags is not None:
+        existing_cover = audio.tags.get("covr")
         audio.tags.clear()
+        if existing_cover:
+            audio["covr"] = existing_cover
 
     audio["\xa9nam"] = [tags.title]
     audio["\xa9ART"] = [tags.artist]
@@ -281,13 +319,13 @@ def _write_mp4(path, tags: TrackTags, config: TaggingConfig, cover, cover_mime) 
         audio["soar"] = [tags.artist_sort]
         audio["soaa"] = [tags.artist_sort]
 
-    freeform = {
+    freeform: dict[str, list[str] | str] = {
         "MusicBrainz Album Id": tags.mb_release_id,
         "MusicBrainz Release Group Id": tags.mb_release_group_id,
         "MusicBrainz Track Id": tags.mb_recording_id,
         "MusicBrainz Release Track Id": tags.mb_track_id,
-        "MusicBrainz Artist Id": "/".join(tags.mb_artist_ids),
-        "MusicBrainz Album Artist Id": "/".join(tags.mb_album_artist_ids),
+        "MusicBrainz Artist Id": tags.mb_artist_ids,
+        "MusicBrainz Album Artist Id": tags.mb_album_artist_ids,
         "MusicBrainz Album Status": tags.status,
         "MusicBrainz Album Type": tags.release_type,
         "MusicBrainz Album Release Country": tags.country,
@@ -298,8 +336,10 @@ def _write_mp4(path, tags: TrackTags, config: TaggingConfig, cover, cover_mime) 
     }
     for name, value in freeform.items():
         key = _MP4_FREEFORM_PREFIX + name
-        if value:
-            audio[key] = [value.encode("utf-8")]
+        values = [v for v in (value if isinstance(value, list) else [value]) if v]
+        if values:
+            # One data atom per value, Picard-style
+            audio[key] = [v.encode("utf-8") for v in values]
         elif key in audio:
             del audio[key]
 
@@ -308,6 +348,49 @@ def _write_mp4(path, tags: TrackTags, config: TaggingConfig, cover, cover_mime) 
                         else MP4Cover.FORMAT_JPEG)
         audio["covr"] = [MP4Cover(cover, imageformat=image_format)]
 
+    audio.save()
+
+
+# ------------------------------------------------------------------------- ASF
+
+def _write_asf(path, tags: TrackTags, config: TaggingConfig) -> None:
+    """WMA/ASF with standard WM/* attribute names (Picard conventions)."""
+    from mutagen.asf import ASF
+
+    audio = ASF(path)
+    if config.clear_existing_tags and audio.tags is not None:
+        audio.tags.clear()
+
+    fields: dict[str, list[str] | str] = {
+        "Title": tags.title,
+        "Author": tags.artist,
+        "WM/AlbumTitle": tags.album,
+        "WM/AlbumArtist": tags.album_artist,
+        "WM/TrackNumber": str(tags.track),
+        "WM/PartOfSet": f"{tags.disc}/{tags.disc_total}",
+        "WM/Year": tags.date,
+        "WM/ArtistSortOrder": tags.artist_sort,
+        "WM/AlbumArtistSortOrder": tags.artist_sort,
+        "WM/Publisher": tags.label,
+        "WM/CatalogNo": tags.catalog_number,
+        "WM/Barcode": tags.barcode,
+        "WM/Media": tags.media,
+        "MusicBrainz/Album Id": tags.mb_release_id,
+        "MusicBrainz/Release Group Id": tags.mb_release_group_id,
+        "MusicBrainz/Track Id": tags.mb_recording_id,
+        "MusicBrainz/Release Track Id": tags.mb_track_id,
+        "MusicBrainz/Artist Id": tags.mb_artist_ids,
+        "MusicBrainz/Album Artist Id": tags.mb_album_artist_ids,
+        "MusicBrainz/Album Status": tags.status,
+        "MusicBrainz/Album Type": tags.release_type,
+        "MusicBrainz/Album Release Country": tags.country,
+    }
+    for key, value in fields.items():
+        values = [v for v in (value if isinstance(value, list) else [value]) if v]
+        if values:
+            audio[key] = values
+        elif key in audio:
+            del audio[key]
     audio.save()
 
 
@@ -338,6 +421,6 @@ def _write_generic(path, tags: TrackTags) -> None:
             continue
         try:
             audio[key] = value
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, TypeError):
             log.debug("format %s does not accept tag %s", path, key)
     audio.save()

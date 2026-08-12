@@ -134,7 +134,8 @@ class LidarrClient:
         status: dict = {}
         while time.monotonic() < deadline:
             status = self.command_status(command_id)
-            if status.get("status") in ("completed", "failed", "aborted", "cancelled"):
+            if status.get("status") in ("completed", "failed", "aborted",
+                                        "cancelled", "orphaned"):
                 return status
             time.sleep(2)
         log.warning("command %d did not finish within %.0fs", command_id, timeout)
