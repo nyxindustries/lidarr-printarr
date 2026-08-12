@@ -28,7 +28,10 @@ env:
 
 jobs:
   docker:
-    runs-on: ubuntu-latest
+    # Org self-hosted runner (zelos/Unraid). Needs Docker only: the version
+    # check uses sed and the release creation runs on the runner's bundled
+    # Node — no Python, gh CLI or sudo required on the host.
+    runs-on: [self-hosted, unraid]
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +51,7 @@ jobs:
       - name: Check version matches pyproject.toml
         if: steps.version.outputs.version != ''
         run: |
-          PY_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          PY_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
           if [ "$PY_VERSION" != "${{ steps.version.outputs.version }}" ]; then
             echo "::error::release version ${{ steps.version.outputs.version }} does not match pyproject.toml version $PY_VERSION — bump pyproject.toml first"
             exit 1
@@ -56,13 +59,17 @@ jobs:
 
       - name: Create tag and GitHub release
         if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "v${{ steps.version.outputs.version }}" \
-            --target "${{ github.sha }}" \
-            --title "v${{ steps.version.outputs.version }}" \
-            --generate-notes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: 'v${{ steps.version.outputs.version }}',
+              target_commitish: context.sha,
+              name: 'v${{ steps.version.outputs.version }}',
+              generate_release_notes: true,
+            });
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3

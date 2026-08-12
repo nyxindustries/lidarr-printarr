@@ -7,19 +7,21 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Org self-hosted runner (zelos, an Unraid box — labels: self-hosted,
+    # Linux, X64, unraid). Tests run inside a container so the runner host
+    # needs nothing but Docker — no sudo, no Python toolchain.
+    runs-on: [self-hosted, unraid]
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
+    container:
+      image: python:${{ matrix.python-version }}-slim
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
       - name: Install system dependencies (ffmpeg for test fixtures, fpcalc)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg libchromaprint-tools
+          apt-get update
+          apt-get install -y --no-install-recommends ffmpeg libchromaprint-tools git
       - name: Install package
         run: pip install -e ".[dev]"
       - name: Lint
