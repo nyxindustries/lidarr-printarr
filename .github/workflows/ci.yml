@@ -5,6 +5,12 @@ on:
     branches: ["**"]
   pull_request:
 
+# The zelos runner predates the node24 externals GitHub Actions now defaults
+# to, so actions inside job containers fail with "/__e/node24/bin/node: no
+# such file". Force node20 until the runner is updated, then remove this.
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
+
 jobs:
   test:
     # Org self-hosted runner (zelos, an Unraid box — labels: self-hosted,

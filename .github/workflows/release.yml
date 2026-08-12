@@ -25,6 +25,9 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  # Force node20 for actions until the zelos runner ships node24 externals
+  # (see the matching note in ci.yml), then remove this.
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
 
 jobs:
   docker:
