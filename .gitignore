@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local config / runtime state
+printarr.toml
+*.log
+.printarr-state.json
+
+# Editors
+.idea/
+.vscode/
+*.swp

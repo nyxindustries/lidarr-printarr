@@ -1,0 +1,17 @@
+services:
+  printarr:
+    build: .
+    # or, once published: image: ghcr.io/styx-techno/lidarr-printarr:latest
+    container_name: printarr
+    environment:
+      PRINTARR_LIDARR_URL: "http://lidarr:8686"
+      PRINTARR_LIDARR_API_KEY: "${LIDARR_API_KEY}"
+      PRINTARR_ACOUSTID_API_KEY: "${ACOUSTID_API_KEY}"
+      PRINTARR_MUSICBRAINZ_CONTACT: "you@example.com"
+      # Lidarr sees /data/downloads, this container mounts it at /downloads:
+      PRINTARR_QUEUE_PATH_MAPPINGS: "/data/downloads => /downloads"
+      PRINTARR_GENERAL_STATE_FILE: "/config/printarr-state.json"
+    volumes:
+      - ./config:/config
+      - /path/to/downloads:/downloads
+    restart: unless-stopped

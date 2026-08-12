@@ -1,0 +1,60 @@
+# printarr example configuration.
+# Copy to ./printarr.toml, ~/.config/printarr/printarr.toml or /config/printarr.toml.
+# Every option can also be set via environment variable: PRINTARR_<SECTION>_<KEY>,
+# e.g. PRINTARR_LIDARR_API_KEY. Environment variables win over this file.
+
+[lidarr]
+url = "http://localhost:8686"
+api_key = ""            # Lidarr -> Settings -> General -> API Key
+verify_ssl = true
+
+[acoustid]
+# Free application key: log in at https://acoustid.org and register an application
+# (https://acoustid.org/new-application). Without a key, printarr still works but
+# matches on tags/durations only — fingerprinting is what makes it reliable.
+api_key = ""
+
+[musicbrainz]
+# Contact info added to the MusicBrainz User-Agent, as their API terms request.
+contact = "you@example.com"
+
+[matching]
+min_acoustid_score = 0.5        # minimum per-file AcoustID match score (0-1)
+min_release_confidence = 0.6    # refuse below this release-level confidence (0-1)
+duration_tolerance = 10.0       # seconds of track-length slack when no fingerprint hit
+max_release_candidates = 8      # releases to fully inspect per album
+require_all_files_matched = true  # refuse if any audio file cannot be mapped to a track
+
+[tagging]
+enabled = true
+write_cover_art = true          # embed the Cover Art Archive front cover
+clear_existing_tags = false     # false = keep unrelated tags (ReplayGain, ratings, ...)
+
+[renaming]
+enabled = true
+file_template = "{track:02d} - {title}"
+multi_disc_template = "{disc}-{track:02d} - {title}"
+# Note: renaming files inside a still-seeding torrent folder will break seeding.
+# Set enabled = false if that matters to you — the corrected tags alone are
+# usually enough for Lidarr to import cleanly.
+
+[queue]
+poll_interval = 60              # seconds between queue polls in watch mode
+import_mode = "auto"            # auto | move | copy ('auto' copies while seeding)
+retry_cooldown = 21600          # retry a failed item after this many seconds
+# When Lidarr and printarr see the download folder under different paths
+# (separate containers), translate between them:
+# path_mappings = ["/data/downloads => /downloads"]
+path_mappings = []
+
+[watch]
+# Extra folders to process independently of the Lidarr queue (watch mode).
+# Each direct subfolder is treated as one album once it has stopped changing.
+folders = []
+quiet_seconds = 120
+trigger_lidarr_scan = false     # trigger a Lidarr scan after fixing a watch folder
+
+[general]
+dry_run = false
+log_level = "INFO"
+state_file = ".printarr-state.json"
