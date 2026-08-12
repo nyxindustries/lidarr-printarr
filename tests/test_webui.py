@@ -132,6 +132,42 @@ def make_worker_env(audio_factory, tmp_path, monkeypatch):
 
 
 class TestWorkerReviewMethods:
+    def test_dry_run_refusal_still_lists_candidates(self, audio_factory, tmp_path,
+                                                    monkeypatch):
+        """Dry-run writes no report files, so the UI candidates must come
+        from the in-memory state (regression: UI showed only the URL box)."""
+        album = build_album(audio_factory, tmp_path,
+                            [("d1.flac", 5.0), ("d2.flac", 7.0)])
+        # Only a badly fitting release exists -> identification refuses
+        decoy = make_release([100.0, 200.0, 300.0],
+                             release_id="dddddddd-0000-0000-0000-000000000000",
+                             group="eeeeeeee-0000-0000-0000-000000000000",
+                             title="Wrong Album")
+        mb = FakeMB([decoy])
+        # Fingerprints resolve to recordings the decoy does not contain, so
+        # the release is considered (via votes) but scores far too low
+        acoustid = FakeAcoustid({5: "unrelated-rec-1", 7: "unrelated-rec-2"},
+                                [decoy.id])
+        processor = make_processor(mb, acoustid, tmp_path)
+        processor.config.general.dry_run = True
+        record = {
+            "downloadId": "DRY1", "title": "Some Dry Release",
+            "status": "completed", "trackedDownloadStatus": "warning",
+            "trackedDownloadState": "importBlocked",
+            "outputPath": str(album), "statusMessages": [],
+        }
+        lidarr = RecordingLidarr([record])
+        worker = QueueWorker(processor.config, lidarr, processor)
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+
+        worker.run_once()
+        assert not (album / REPORT_FILENAME).exists()  # dry run: no files
+        items = worker.list_review_items()
+        entry = items["queue"][0]
+        assert entry["candidates"], "candidates must be served from state"
+        assert entry["candidates"][0]["title"] == "Wrong Album"
+        assert "score" in entry["candidates"][0]
+
     def test_list_review_items(self, audio_factory, tmp_path, monkeypatch):
         album, worker, lidarr = make_worker_env(audio_factory, tmp_path, monkeypatch)
         (album / REPORT_FILENAME).write_text(json.dumps({

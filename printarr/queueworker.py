@@ -122,13 +122,18 @@ class StateStore:
         return (time.time() - entry.get("at", 0)) < cooldown
 
     def record_download(self, download_id: str, outcome: str, reason: str = "",
-                       title: str = "", path: str = "") -> None:
+                       title: str = "", path: str = "",
+                       candidates: list | None = None) -> None:
         with self._lock:
             entry = {"at": time.time(), "outcome": outcome, "reason": reason}
             if title:
                 entry["title"] = title
             if path:
                 entry["path"] = path
+            if candidates:
+                # The review UI shows these; dry-run writes no report files,
+                # so the state is the only place they survive
+                entry["candidates"] = candidates[:10]
             self.data["queue"][download_id] = entry
             self.save()
 
@@ -145,11 +150,13 @@ class StateStore:
             return True
         return (time.time() - entry.get("at", 0)) < cooldown
 
-    def record_folder(self, key: str, outcome: str, reason: str = "") -> None:
+    def record_folder(self, key: str, outcome: str, reason: str = "",
+                      candidates: list | None = None) -> None:
         with self._lock:
-            self.data["folders"][key] = {
-                "at": time.time(), "outcome": outcome, "reason": reason,
-            }
+            entry = {"at": time.time(), "outcome": outcome, "reason": reason}
+            if candidates:
+                entry["candidates"] = candidates[:10]
+            self.data["folders"][key] = entry
             self.save()
 
     def clear_folder(self, key: str) -> None:
@@ -238,7 +245,8 @@ class QueueWorker:
 
         result = self.processor.process_folder(local_path, lidarr_candidates=candidates)
         if not result.success:
-            return self._fail(download_id, title, result.reason, path=str(local_path))
+            return self._fail(download_id, title, result.reason, path=str(local_path),
+                              candidates=result.report.candidates if result.report else None)
 
         if self.config.general.dry_run:
             log.info("[dry-run] would trigger Lidarr import for %s", title)
@@ -253,12 +261,12 @@ class QueueWorker:
         return QueueOutcome(download_id, title, triggered, reason,
                             import_triggered=triggered)
 
-    def _fail(self, download_id: str, title: str, reason: str,
-              path: str = "") -> QueueOutcome:
+    def _fail(self, download_id: str, title: str, reason: str, path: str = "",
+              candidates: list | None = None) -> QueueOutcome:
         # In dry-run mode the StateStore is in-memory only, so recording is safe
         log.warning("%s: %s", title, reason)
         self.state.record_download(download_id, "failed", reason,
-                                   title=title, path=path)
+                                   title=title, path=path, candidates=candidates)
         return QueueOutcome(download_id, title, False, reason)
 
     # ---------------------------------------------------------------- imports
@@ -411,10 +419,11 @@ class QueueWorker:
             log.exception("unexpected error processing %s", child)
             self.state.record_folder(key, "failed", f"unexpected error: {exc}")
             return
+        candidates = result.report.candidates if result.report else None
         if self.config.general.dry_run:
             # State is in-memory in dry-run mode; never trigger Lidarr actions
             self.state.record_folder(key, "processed" if result.success else "failed",
-                                     result.reason)
+                                     result.reason, candidates=candidates)
             return
         if result.success and self.config.watch.trigger_lidarr_scan:
             remote = self.mapper.to_remote(str(child))
@@ -423,7 +432,7 @@ class QueueWorker:
             except LidarrError as exc:
                 log.warning("scan trigger failed for %s: %s", child, exc)
         self.state.record_folder(key, "processed" if result.success else "failed",
-                                 result.reason)
+                                 result.reason, candidates=candidates)
 
     # ------------------------------------------------------- review UI support
 
@@ -453,7 +462,7 @@ class QueueWorker:
                 "reason": entry.get("reason", ""),
                 "path": str(local),
                 "exists": local.exists(),
-                "candidates": self._read_report(local),
+                "candidates": entry.get("candidates") or self._read_report(local),
             })
 
         folders: list[dict] = []
@@ -467,7 +476,7 @@ class QueueWorker:
                 "path": key,
                 "title": folder.name,
                 "reason": entry.get("reason", ""),
-                "candidates": self._read_report(folder),
+                "candidates": entry.get("candidates") or self._read_report(folder),
             })
         return {"queue": queue_items, "folders": folders, "error": error}
 
