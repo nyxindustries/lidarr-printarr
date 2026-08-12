@@ -54,6 +54,16 @@ folders = []
 quiet_seconds = 120
 trigger_lidarr_scan = false     # trigger a Lidarr scan after fixing a watch folder
 
+[web]
+# Review UI for downloads printarr refused to match automatically:
+# pick one of the considered candidates or paste any MusicBrainz URL,
+# and printarr force-tags the folder and triggers the import.
+# Started automatically by `printarr watch` when enabled (or run `printarr web`).
+# No authentication — keep it on localhost or behind a reverse proxy.
+enabled = false
+host = "127.0.0.1"     # use "0.0.0.0" inside Docker
+port = 8687
+
 [general]
 dry_run = false
 log_level = "INFO"

@@ -14,5 +14,8 @@ RUN pip install --no-cache-dir .
 VOLUME /config
 WORKDIR /config
 
+# Review web UI (enable via [web] in printarr.toml, host = "0.0.0.0")
+EXPOSE 8687
+
 ENTRYPOINT ["printarr"]
 CMD ["watch"]
