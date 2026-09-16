@@ -75,6 +75,14 @@ class QueueConfig:
     import_mode: str = "auto"  # 'auto' | 'move' | 'copy'
     # Retry a previously failed/refused item after this many seconds
     retry_cooldown: int = 6 * 3600
+    # Torrent downloads keep seeding from their folder, and tagging or renaming
+    # those files corrupts the seed. When enabled, queue items with
+    # protocol "torrent" are copied to staging_dir first; only the copy is
+    # tagged, renamed and imported (importMode "move"), the original is never touched.
+    protect_torrents: bool = True
+    # Where torrent copies are staged. Empty = ".printarr-staging" next to the
+    # download folder (same volume, so Lidarr's move stays cheap).
+    staging_dir: str = ""
     # Path prefix translations between Lidarr's view and printarr's view,
     # e.g. "/data/downloads => /downloads" when running in separate containers
     path_mappings: list[str] = field(default_factory=list)

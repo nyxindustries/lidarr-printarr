@@ -42,6 +42,14 @@ multi_disc_template = "{disc}-{track:02d} - {title}"
 poll_interval = 60              # seconds between queue polls in watch mode
 import_mode = "auto"            # auto | move | copy ('auto' copies while seeding)
 retry_cooldown = 21600          # retry a failed item after this many seconds
+# Torrent downloads keep seeding from their folder; writing tags into those
+# files corrupts the seed. Queue items with protocol "torrent" are therefore
+# copied to a staging folder first, and only the copy is tagged, renamed and
+# imported (importMode "move"). The original stays byte-identical.
+protect_torrents = true
+# Where those copies live. Empty = ".printarr-staging" next to the download
+# folder (same volume, so Lidarr's move is cheap).
+staging_dir = ""
 # When Lidarr and printarr see the download folder under different paths
 # (separate containers), translate between them:
 # path_mappings = ["/data/downloads => /downloads"]
