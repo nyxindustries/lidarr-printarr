@@ -5,14 +5,18 @@ Queue flow per stuck item:
 2. Build match candidates from the album Lidarr grabbed (its known releases),
    falling back to blind identification for unknown-artist downloads.
 3. Fingerprint, match, tag (with MusicBrainz IDs) and rename the files.
+   Torrent downloads are still seeding from that folder, so they are copied
+   to a staging folder first and only the copy is modified.
 4. Trigger the import: an explicit ManualImport command with per-file track
-   mapping when the album is in Lidarr, else a DownloadedAlbumsScan.
+   mapping when the album is in Lidarr, else a DownloadedAlbumsScan. A staged
+   copy is imported with importMode "move" and whatever is left is discarded.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -28,6 +32,9 @@ from printarr.log import get_logger
 from printarr.processor import Processor, ProcessResult
 
 log = get_logger(__name__)
+
+# Default staging folder for torrent copies, created next to the download folder
+STAGING_DIRNAME = ".printarr-staging"
 
 
 class PathMapper:
@@ -228,6 +235,24 @@ class QueueWorker:
         log.info("handling stuck download: %s (%s)", title,
                  record.get("trackedDownloadState"))
 
+        try:
+            work_path, staged = self._stage_if_torrent(record, local_path)
+        except OSError as exc:
+            return self._fail(download_id, title, f"could not stage torrent copy: {exc}",
+                              path=str(local_path))
+        try:
+            return self._process_and_import(record, local_path, work_path, staged)
+        finally:
+            if staged:
+                self._discard_staging(work_path)
+
+    def _process_and_import(self, record: dict, local_path: Path, work_path: Path,
+                            staged: bool) -> QueueOutcome:
+        """Identify, tag and import `work_path` (the download itself, or its
+        staged copy). State always refers to `local_path`, the real download."""
+        download_id = record["downloadId"]
+        title = record.get("title", "?")
+
         candidates = None
         album = record.get("album")
         if album and album.get("id") is not None:
@@ -236,14 +261,14 @@ class QueueWorker:
                 full_album = self.lidarr.album(album["id"])
                 artist_name = (record.get("artist") or {}).get("artistName", "")
                 from printarr.audiofile import scan_folder
-                file_count = len(scan_folder(local_path))
+                file_count = len(scan_folder(work_path))
                 candidates = candidates_from_album(
                     self.lidarr, full_album, artist_name, file_count=file_count,
                     max_candidates=self.config.matching.max_release_candidates)
             except LidarrError as exc:
                 log.warning("could not build candidates from Lidarr album: %s", exc)
 
-        result = self.processor.process_folder(local_path, lidarr_candidates=candidates)
+        result = self.processor.process_folder(work_path, lidarr_candidates=candidates)
         if not result.success:
             return self._fail(download_id, title, result.reason, path=str(local_path),
                               candidates=result.report.candidates if result.report else None)
@@ -254,12 +279,56 @@ class QueueWorker:
                                        title=title, path=str(local_path))
             return QueueOutcome(download_id, title, True, "dry run")
 
-        triggered, reason = self._trigger_import(record, result)
+        triggered, reason = self._trigger_import(
+            record, result, staged_folder=work_path if staged else None)
         outcome = "imported" if triggered else "import-failed"
         self.state.record_download(download_id, outcome, reason,
                                    title=title, path=str(local_path))
         return QueueOutcome(download_id, title, triggered, reason,
                             import_triggered=triggered)
+
+    # ------------------------------------------------------- torrent staging
+
+    def _is_protected_torrent(self, record: dict) -> bool:
+        """Torrent downloads keep seeding from their folder; modifying those
+        files corrupts the seed, so they are processed on a copy instead."""
+        if not self.config.queue.protect_torrents or self.config.general.dry_run:
+            return False
+        return str(record.get("protocol") or "").lower() == "torrent"
+
+    def _staging_root(self, local_path: Path) -> Path:
+        configured = self.config.queue.staging_dir
+        if configured:
+            return Path(configured).expanduser()
+        return local_path.parent / STAGING_DIRNAME
+
+    def _stage_if_torrent(self, record: dict, local_path: Path) -> tuple[Path, bool]:
+        """Returns (path to work on, whether that path is a disposable copy)."""
+        if not self._is_protected_torrent(record):
+            return local_path, False
+        root = self._staging_root(local_path)
+        if root == local_path or local_path in root.parents:
+            raise OSError(f"staging_dir {root} lies inside the download folder")
+        target = root / (local_path.stem if local_path.is_file() else local_path.name)
+        if target.exists():
+            # Leftover of an interrupted run: never trust it, copy afresh
+            shutil.rmtree(target)
+        root.mkdir(parents=True, exist_ok=True)
+        log.info("torrent still seeds from %s — working on a copy in %s",
+                 local_path, target)
+        if local_path.is_file():
+            target.mkdir()
+            shutil.copy2(local_path, target / local_path.name)
+        else:
+            shutil.copytree(local_path, target, symlinks=False)
+        return target, True
+
+    @staticmethod
+    def _discard_staging(path: Path) -> None:
+        # After a successful import Lidarr has moved the audio files out; what
+        # remains (covers, nfo, report) is disposable. After a failure the
+        # next attempt copies afresh anyway.
+        shutil.rmtree(path, ignore_errors=True)
 
     def _fail(self, download_id: str, title: str, reason: str, path: str = "",
               candidates: list | None = None) -> QueueOutcome:
@@ -271,17 +340,24 @@ class QueueWorker:
 
     # ---------------------------------------------------------------- imports
 
-    def _trigger_import(self, record: dict, result: ProcessResult) -> tuple[bool, str]:
+    def _trigger_import(self, record: dict, result: ProcessResult,
+                        staged_folder: Path | None = None) -> tuple[bool, str]:
         download_id = record["downloadId"]
         candidate = result.lidarr_candidate
 
         if candidate is None:
             # Album unknown to Lidarr (unmatched download): the files now carry
             # MusicBrainz IDs, so a scan will match if the artist is monitored.
-            return self._trigger_scan(record)
+            return self._trigger_scan(record, staged_folder)
 
         try:
-            items = self.lidarr.manual_import(download_id=download_id)
+            if staged_folder is not None:
+                # The download client still points Lidarr at the seeding
+                # original; list the staged copy by folder instead
+                items = self.lidarr.manual_import(
+                    folder=self.mapper.to_remote(str(staged_folder)))
+            else:
+                items = self.lidarr.manual_import(download_id=download_id)
         except LidarrError as exc:
             return False, f"manualimport lookup failed: {exc}"
 
@@ -326,11 +402,12 @@ class QueueWorker:
             log.warning("no manualimport items matched the processed files for %s "
                         "— falling back to a folder scan (path mapping mismatch?)",
                         record.get("title", ""))
-            return self._trigger_scan(record)
+            return self._trigger_scan(record, staged_folder)
 
+        # A staged copy is ours to give away; the original keeps seeding
+        import_mode = "move" if staged_folder is not None else self.config.queue.import_mode
         try:
-            command = self.lidarr.trigger_manual_import(
-                files, import_mode=self.config.queue.import_mode)
+            command = self.lidarr.trigger_manual_import(files, import_mode=import_mode)
             status = self.lidarr.wait_for_command(command.get("id"))
         except LidarrError as exc:
             return False, f"ManualImport command failed: {exc}"
@@ -344,13 +421,18 @@ class QueueWorker:
                  record.get("title", ""))
         return True, f"imported {len(files)} file(s)"
 
-    def _trigger_scan(self, record: dict) -> tuple[bool, str]:
+    def _trigger_scan(self, record: dict,
+                      staged_folder: Path | None = None) -> tuple[bool, str]:
         output_path = record.get("outputPath") or ""
         download_id = record.get("downloadId") or ""
+        import_mode = self.config.queue.import_mode
+        if staged_folder is not None:
+            output_path = self.mapper.to_remote(str(staged_folder))
+            import_mode = "move"
         try:
             command = self.lidarr.trigger_downloaded_albums_scan(
                 output_path, download_client_id=download_id,
-                import_mode=self.config.queue.import_mode)
+                import_mode=import_mode)
             status = self.lidarr.wait_for_command(command.get("id"))
         except LidarrError as exc:
             return False, f"DownloadedAlbumsScan failed: {exc}"
@@ -510,19 +592,28 @@ class QueueWorker:
             if not local.exists():
                 return False, f"path not accessible: {local}"
 
-            result = self.processor.process_folder(
-                local, forced_release_mbid=release_mbid,
-                forced_release_group_mbid=release_group_mbid)
-            if not result.success:
-                return False, result.reason
-            if self.config.general.dry_run:
-                return True, "dry run: matched, would trigger import"
+            try:
+                work_path, staged = self._stage_if_torrent(record, local)
+            except OSError as exc:
+                return False, f"could not stage torrent copy: {exc}"
+            try:
+                result = self.processor.process_folder(
+                    work_path, forced_release_mbid=release_mbid,
+                    forced_release_group_mbid=release_group_mbid)
+                if not result.success:
+                    return False, result.reason
+                if self.config.general.dry_run:
+                    return True, "dry run: matched, would trigger import"
 
-            triggered, reason = self._trigger_scan(record)
-            self.state.record_download(
-                download_id, "imported" if triggered else "import-failed",
-                reason, title=title, path=str(local))
-            return triggered, reason
+                triggered, reason = self._trigger_scan(
+                    record, work_path if staged else None)
+                self.state.record_download(
+                    download_id, "imported" if triggered else "import-failed",
+                    reason, title=title, path=str(local))
+                return triggered, reason
+            finally:
+                if staged:
+                    self._discard_staging(work_path)
 
     def assign_folder(self, path: str, release_mbid: str | None = None,
                       release_group_mbid: str | None = None) -> tuple[bool, str]:

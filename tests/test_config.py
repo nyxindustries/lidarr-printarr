@@ -77,3 +77,16 @@ def test_config_is_dataclass_complete():
     for section in ("lidarr", "acoustid", "musicbrainz", "matching",
                     "tagging", "renaming", "queue", "watch", "general"):
         assert hasattr(config, section)
+
+
+def test_torrent_protection_defaults_and_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = load_config(environ={})
+    assert config.queue.protect_torrents is True
+    assert config.queue.staging_dir == ""
+    config = load_config(environ={
+        "PRINTARR_QUEUE_PROTECT_TORRENTS": "false",
+        "PRINTARR_QUEUE_STAGING_DIR": "/data/printarr-staging",
+    })
+    assert config.queue.protect_torrents is False
+    assert config.queue.staging_dir == "/data/printarr-staging"

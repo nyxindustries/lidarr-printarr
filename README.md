@@ -177,10 +177,14 @@ Boards of Canada — Geogaddi (2002)
 
 ## Notes & caveats
 
-- **Torrent seeding**: renaming files inside a still-seeding folder breaks
-  seeding. Set `renaming.enabled = false` if that matters — corrected tags
-  alone are usually enough for a clean Lidarr import (`import_mode = "auto"`
-  copies instead of moving while a torrent is seeding).
+- **Torrent seeding**: writing tags or renaming files inside a still-seeding
+  folder corrupts the seed. Queue items Lidarr reports as `protocol = torrent`
+  are therefore never modified in place: printarr copies the folder to
+  `queue.staging_dir` (default `.printarr-staging` next to the download),
+  tags and renames the copy and imports it with `importMode = "move"`. The
+  original keeps seeding untouched. `queue.protect_torrents = false` restores
+  the old in-place behaviour. Usenet downloads are still processed in place
+  (`import_mode` applies to them).
 - printarr never deletes audio files and never moves them out of their folder;
   Lidarr stays the owner of your library layout.
 - MusicBrainz data improves over time — failed items are retried after
